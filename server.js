@@ -126,7 +126,6 @@ app.get('/books', async (req, res) => {
     const conditions = [];
     const params = [];
 
-    // Helper to conditionally add a condition
     const addCondition = (sql, value) => {
       if (value !== undefined && value !== null && value !== '') {
         if (typeof value === 'string' && value.trim() === '') return;
@@ -166,6 +165,8 @@ app.get('/books', async (req, res) => {
       orderByClause = `ORDER BY authors.name ${order}`;
     } else if (sortBy === 'year') {
       orderByClause = `ORDER BY books.publication_year ${order}`;
+    } else if (sortBy === 'rating') {
+      orderByClause = `ORDER BY avg_rating ${order} NULLS LAST`;
     }
 
     // Count query
@@ -178,7 +179,7 @@ app.get('/books', async (req, res) => {
     const countResult = await pool.query(countQuery, params);
     const total = countResult.rows[0].total;
 
-    // Data query with is_borrowed
+    // Data query with is_borrowed, avg_rating, review_count
     const offset = (page - 1) * limit;
     const dataQuery = `
       SELECT books.id, books.title, authors.name AS author, books.author_id, books.cover_image_url,
@@ -186,10 +187,14 @@ app.get('/books', async (req, res) => {
              EXISTS (
                SELECT 1 FROM loans l
                WHERE l.book_id = books.id AND l.returned_at IS NULL
-             ) AS is_borrowed
+             ) AS is_borrowed,
+             COALESCE(ROUND(AVG(r.rating)::numeric, 1), 0) AS avg_rating,
+             COUNT(r.id) AS review_count
       FROM books
       JOIN authors ON books.author_id = authors.id
+      LEFT JOIN reviews r ON r.book_id = books.id
       ${whereClause}
+      GROUP BY books.id, authors.name
       ${orderByClause}
       LIMIT $${params.length + 1}
       OFFSET $${params.length + 2}
@@ -222,10 +227,14 @@ app.get('/books/:id', async (req, res) => {
               EXISTS (
                 SELECT 1 FROM loans l
                 WHERE l.book_id = books.id AND l.returned_at IS NULL
-              ) AS is_borrowed
+              ) AS is_borrowed,
+              COALESCE(ROUND(AVG(r.rating)::numeric, 1), 0) AS avg_rating,
+              COUNT(r.id) AS review_count
        FROM books
        JOIN authors ON books.author_id = authors.id
-       WHERE books.id = $1`,
+       LEFT JOIN reviews r ON r.book_id = books.id
+       WHERE books.id = $1
+       GROUP BY books.id, authors.name`,
       [id]
     );
     if (result.rows.length === 0) {
@@ -276,7 +285,7 @@ app.post('/books', authenticateToken, authorize('admin', 'librarian'), async (re
     const book = await pool.query(
       `SELECT books.id, books.title, authors.name AS author, books.author_id, books.cover_image_url,
               books.genre, books.publication_year, books.isbn,
-              false AS is_borrowed
+              false AS is_borrowed, 0 AS avg_rating, 0 AS review_count
        FROM books
        JOIN authors ON books.author_id = authors.id
        WHERE books.id = $1`,
@@ -350,10 +359,14 @@ app.patch('/books/:id', authenticateToken, authorize('admin', 'librarian'), asyn
               EXISTS (
                 SELECT 1 FROM loans l
                 WHERE l.book_id = books.id AND l.returned_at IS NULL
-              ) AS is_borrowed
+              ) AS is_borrowed,
+              COALESCE(ROUND(AVG(r.rating)::numeric, 1), 0) AS avg_rating,
+              COUNT(r.id) AS review_count
        FROM books
        JOIN authors ON books.author_id = authors.id
-       WHERE books.id = $1`,
+       LEFT JOIN reviews r ON r.book_id = books.id
+       WHERE books.id = $1
+       GROUP BY books.id, authors.name`,
       [id]
     );
     res.json(updated.rows[0]);
@@ -498,7 +511,7 @@ app.delete('/authors/:id', authenticateToken, authorize('admin', 'librarian'), a
 });
 
 // ----------------------------------------------------------------------
-// Authentication Routes (with role)
+// Authentication Routes
 // ----------------------------------------------------------------------
 
 app.post('/auth/register', async (req, res) => {
@@ -523,7 +536,6 @@ app.post('/auth/register', async (req, res) => {
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
-    // Check if email is in admin list (comma-separated in ADMIN_EMAILS env)
     const adminEmails = process.env.ADMIN_EMAILS
       ? process.env.ADMIN_EMAILS.split(',').map(e => e.trim().toLowerCase())
       : [];
@@ -650,7 +662,6 @@ app.patch('/auth/me', authenticateToken, async (req, res) => {
 // Loan Routes
 // ----------------------------------------------------------------------
 
-// GET /loans - get current user's loans (active & history)
 app.get('/loans', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -670,7 +681,6 @@ app.get('/loans', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /loans - borrow a book
 app.post('/loans', authenticateToken, async (req, res) => {
   const { bookId } = req.body;
   const userId = req.user.userId;
@@ -710,7 +720,6 @@ app.post('/loans', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /loans/:id/return - return a borrowed book
 app.patch('/loans/:id/return', authenticateToken, async (req, res) => {
   const loanId = Number(req.params.id);
   if (isNaN(loanId)) {
@@ -736,6 +745,176 @@ app.patch('/loans/:id/return', authenticateToken, async (req, res) => {
     );
 
     res.json({ message: 'Book returned successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------------------------
+// Reviews Routes
+// ----------------------------------------------------------------------
+
+// GET /books/:id/reviews - get all reviews for a book
+app.get('/books/:id/reviews', async (req, res) => {
+  const bookId = Number(req.params.id);
+  if (isNaN(bookId)) {
+    return res.status(400).json({ message: 'Invalid book id' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT r.id, r.rating, r.comment, r.created_at, r.updated_at,
+              u.id AS user_id, u.username, u.avatar_url
+       FROM reviews r
+       JOIN users u ON r.user_id = u.id
+       WHERE r.book_id = $1
+       ORDER BY r.created_at DESC`,
+      [bookId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /books/:id/reviews - create a review
+app.post('/books/:id/reviews', authenticateToken, async (req, res) => {
+  const bookId = Number(req.params.id);
+  if (isNaN(bookId)) {
+    return res.status(400).json({ message: 'Invalid book id' });
+  }
+  const { rating, comment } = req.body;
+  const userId = req.user.userId;
+
+  if (rating === undefined || !Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ message: 'Rating must be an integer between 1 and 5' });
+  }
+  if (comment !== undefined && typeof comment !== 'string') {
+    return res.status(400).json({ message: 'Comment must be a string' });
+  }
+
+  try {
+    // Check if book exists
+    const bookCheck = await pool.query('SELECT id FROM books WHERE id = $1', [bookId]);
+    if (bookCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Book not found' });
+    }
+
+    // Check if user already reviewed this book
+    const existing = await pool.query(
+      'SELECT id FROM reviews WHERE book_id = $1 AND user_id = $2',
+      [bookId, userId]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ message: 'You already reviewed this book' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO reviews (book_id, user_id, rating, comment)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, rating, comment, created_at, updated_at`,
+      [bookId, userId, rating, comment || null]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PATCH /reviews/:id - update a review (only own review)
+app.patch('/reviews/:id', authenticateToken, async (req, res) => {
+  const reviewId = Number(req.params.id);
+  if (isNaN(reviewId)) {
+    return res.status(400).json({ message: 'Invalid review id' });
+  }
+  const { rating, comment } = req.body;
+  const userId = req.user.userId;
+
+  if (rating !== undefined && (!Number.isInteger(rating) || rating < 1 || rating > 5)) {
+    return res.status(400).json({ message: 'Rating must be an integer between 1 and 5' });
+  }
+  if (comment !== undefined && typeof comment !== 'string') {
+    return res.status(400).json({ message: 'Comment must be a string' });
+  }
+
+  try {
+    // Check if review exists and belongs to user
+    const reviewCheck = await pool.query(
+      'SELECT id, user_id FROM reviews WHERE id = $1',
+      [reviewId]
+    );
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Review not found' });
+    }
+    if (reviewCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ message: 'You can only edit your own reviews' });
+    }
+
+    // Build dynamic update
+    const fields = [];
+    const values = [];
+    let index = 1;
+
+    if (rating !== undefined) {
+      fields.push(`rating = $${index}`);
+      values.push(rating);
+      index++;
+    }
+    if (comment !== undefined) {
+      fields.push(`comment = $${index}`);
+      values.push(comment);
+      index++;
+    }
+    if (fields.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    fields.push(`updated_at = NOW()`);
+    values.push(reviewId);
+    const setClause = fields.join(', ');
+    const result = await pool.query(
+      `UPDATE reviews SET ${setClause} WHERE id = $${index} RETURNING id, rating, comment, created_at, updated_at`,
+      values
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// DELETE /reviews/:id - delete a review (own review or admin)
+app.delete('/reviews/:id', authenticateToken, async (req, res) => {
+  const reviewId = Number(req.params.id);
+  if (isNaN(reviewId)) {
+    return res.status(400).json({ message: 'Invalid review id' });
+  }
+  const userId = req.user.userId;
+  const userRole = req.user.role;
+
+  try {
+    // Check if review exists
+    const reviewCheck = await pool.query(
+      'SELECT id, user_id FROM reviews WHERE id = $1',
+      [reviewId]
+    );
+    if (reviewCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Review not found' });
+    }
+    const review = reviewCheck.rows[0];
+
+    // Allow if user owns review or is admin
+    if (review.user_id !== userId && userRole !== 'admin') {
+      return res.status(403).json({ message: 'You can only delete your own reviews' });
+    }
+
+    await pool.query('DELETE FROM reviews WHERE id = $1', [reviewId]);
+    res.status(204).send();
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
