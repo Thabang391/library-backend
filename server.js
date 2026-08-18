@@ -6,7 +6,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000; // Use Render's PORT or fallback to 3000
 const pool = require('./db');
 const bcrypt = require('bcrypt');          // for password hashing
 const jwt = require('jsonwebtoken');       // for generating/verifying JWTs
@@ -21,29 +21,35 @@ pool.query('SELECT NOW()', (err, res) => {
 });
 
 // Middleware to parse JSON request bodies
+// For now, allow all origins to get CORS working. Later you can restrict.
+app.use(cors());
+
+// If you want to restrict later, use this instead of app.use(cors()):
+/*
 const allowedOrigins = [
-  'https://library-backend-cm1v.onrender.com/',
-  'https://library-frontend-topaz.vercel.app/', // replace with actual Vercel URL later
+  'http://localhost:5173',
+  'https://library-frontend-topxs.vercel.app', // no trailing slash
 ];
+
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(null, false); // disallow, but don't throw error
     }
   }
-}));    
+}));
+*/
+
 app.use(express.json());
 
 // ----------------------------------------------------------------------
 // Authentication Middleware
 // ----------------------------------------------------------------------
-// Verifies the JWT from the Authorization header and attaches the user
-// payload to req.user if valid.
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // "Bearer TOKEN"
+  const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
     return res.status(401).json({ message: 'Access token required' });
@@ -53,7 +59,7 @@ function authenticateToken(req, res, next) {
     if (err) {
       return res.status(403).json({ message: 'Invalid or expired token' });
     }
-    req.user = user;   // { userId, email, iat, exp }
+    req.user = user;
     next();
   });
 }
@@ -76,18 +82,18 @@ app.get('/books', async (req, res) => {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.max(parseInt(req.query.limit) || 10, 1);
     const order = req.query.order === 'desc' ? 'DESC' : 'ASC';
-    const sortBy = req.query.sortBy;               // 'title' or 'author'
+    const sortBy = req.query.sortBy;
     const authorFilter = req.query.author ? req.query.author.trim() : null;
 
     // 2. Build ORDER BY clause (whitelist to prevent SQL injection)
-    let orderByClause = `ORDER BY books.id ASC`;   // default
+    let orderByClause = `ORDER BY books.id ASC`;
     if (sortBy === 'title') {
       orderByClause = `ORDER BY books.title ${order}`;
     } else if (sortBy === 'author') {
       orderByClause = `ORDER BY authors.name ${order}`;
     }
 
-    // 3. Build WHERE clause for filtering by author name (exact, case-insensitive)
+    // 3. Build WHERE clause for filtering by author name
     const filterParams = [];
     let whereClause = '';
     if (authorFilter) {
@@ -95,7 +101,7 @@ app.get('/books', async (req, res) => {
       whereClause = `WHERE authors.name ILIKE $1`;
     }
 
-    // 4. Get total count after filtering (separate query)
+    // 4. Get total count after filtering
     const countQuery = `
       SELECT COUNT(*)::int AS total
       FROM books
@@ -122,7 +128,6 @@ app.get('/books', async (req, res) => {
       offset,
     ]);
 
-    // 6. Return response with metadata
     res.json({
       data: dataResult.rows,
       total,
@@ -135,7 +140,7 @@ app.get('/books', async (req, res) => {
   }
 });
 
-// GET /books/:id - get one book by ID (with author name)
+// GET /books/:id - get one book by ID
 app.get('/books/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -164,29 +169,24 @@ app.get('/books/:id', async (req, res) => {
 app.post('/books', authenticateToken, async (req, res) => {
   const { title, authorId } = req.body;
 
-  // Validate title
   if (typeof title !== 'string' || title.trim() === '') {
     return res.status(400).json({ message: 'Title must be a non-empty string' });
   }
-  // Validate authorId
   if (!Number.isInteger(authorId) || authorId <= 0) {
     return res.status(400).json({ message: 'authorId must be a positive integer' });
   }
 
   try {
-    // Check if author exists
     const authorCheck = await pool.query('SELECT id FROM authors WHERE id = $1', [authorId]);
     if (authorCheck.rows.length === 0) {
       return res.status(400).json({ message: 'Author does not exist' });
     }
 
-    // Insert book
     const result = await pool.query(
       'INSERT INTO books (title, author_id) VALUES ($1, $2) RETURNING *',
       [title.trim(), authorId]
     );
 
-    // Fetch the joined result for consistent response
     const book = await pool.query(
       `SELECT books.id, books.title, authors.name AS author
        FROM books
@@ -201,7 +201,7 @@ app.post('/books', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /books/:id - update a book's title and/or author (requires authentication)
+// PATCH /books/:id - update a book's title and/or author
 app.patch('/books/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -210,7 +210,6 @@ app.patch('/books/:id', authenticateToken, async (req, res) => {
 
   const { title, authorId } = req.body;
 
-  // Validate if provided
   if (title !== undefined && (typeof title !== 'string' || title.trim() === '')) {
     return res.status(400).json({ message: 'Title must be a non-empty string' });
   }
@@ -219,18 +218,15 @@ app.patch('/books/:id', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Fetch existing book
     const existing = await pool.query('SELECT * FROM books WHERE id = $1', [id]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ message: 'Book not found' });
     }
     const current = existing.rows[0];
 
-    // Determine new values (use existing if not provided)
     const newTitle = title !== undefined ? title.trim() : current.title;
     const newAuthorId = authorId !== undefined ? authorId : current.author_id;
 
-    // If authorId is being changed, verify the new author exists
     if (authorId !== undefined) {
       const authorCheck = await pool.query('SELECT id FROM authors WHERE id = $1', [authorId]);
       if (authorCheck.rows.length === 0) {
@@ -238,13 +234,11 @@ app.patch('/books/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    // Update the book
     await pool.query(
       'UPDATE books SET title = $1, author_id = $2 WHERE id = $3',
       [newTitle, newAuthorId, id]
     );
 
-    // Fetch the updated book with join for response
     const updated = await pool.query(
       `SELECT books.id, books.title, authors.name AS author
        FROM books
@@ -259,7 +253,7 @@ app.patch('/books/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /books/:id - delete a book (requires authentication)
+// DELETE /books/:id - delete a book
 app.delete('/books/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -307,19 +301,16 @@ app.get('/authors/:id', async (req, res) => {
   }
 
   try {
-    // Fetch author info
     const authorResult = await pool.query('SELECT id, name FROM authors WHERE id = $1', [id]);
     if (authorResult.rows.length === 0) {
       return res.status(404).json({ message: 'Author not found' });
     }
 
-    // Fetch books by this author
     const booksResult = await pool.query(
       'SELECT id, title FROM books WHERE author_id = $1',
       [id]
     );
 
-    // Combine into one response
     res.json({
       ...authorResult.rows[0],
       books: booksResult.rows,
@@ -330,7 +321,7 @@ app.get('/authors/:id', async (req, res) => {
   }
 });
 
-// POST /authors - create a new author (requires authentication)
+// POST /authors - create a new author
 app.post('/authors', authenticateToken, async (req, res) => {
   const { name } = req.body;
 
@@ -345,7 +336,6 @@ app.post('/authors', authenticateToken, async (req, res) => {
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    // Unique violation (duplicate name)
     if (err.code === '23505') {
       return res.status(409).json({ message: 'Author already exists' });
     }
@@ -354,7 +344,7 @@ app.post('/authors', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /authors/:id - update author name (requires authentication)
+// PATCH /authors/:id - update author name
 app.patch('/authors/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -383,7 +373,7 @@ app.patch('/authors/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /authors/:id - delete author and cascade delete their books (requires authentication)
+// DELETE /authors/:id - delete author and cascade delete their books
 app.delete('/authors/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -410,7 +400,6 @@ app.delete('/authors/:id', authenticateToken, async (req, res) => {
 app.post('/auth/register', async (req, res) => {
   const { email, password } = req.body;
 
-  // Basic validation
   if (typeof email !== 'string' || email.trim() === '' || !email.includes('@')) {
     return res.status(400).json({ message: 'Valid email is required' });
   }
@@ -419,17 +408,14 @@ app.post('/auth/register', async (req, res) => {
   }
 
   try {
-    // Check if email already exists
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.trim().toLowerCase()]);
     if (existing.rows.length > 0) {
       return res.status(409).json({ message: 'Email already registered' });
     }
 
-    // Hash the password with bcrypt
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
-    // Insert user into database
     const result = await pool.query(
       'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at',
       [email.trim().toLowerCase(), passwordHash]
@@ -451,7 +437,6 @@ app.post('/auth/login', async (req, res) => {
   }
 
   try {
-    // Find user by email
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim().toLowerCase()]);
     if (result.rows.length === 0) {
       return res.status(401).json({ message: 'Invalid email or password' });
@@ -459,20 +444,17 @@ app.post('/auth/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Compare provided password with stored hash
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
-    // Generate JWT (payload includes userId and email)
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET,
       { expiresIn: '1h' }
     );
 
-    // Send token and user info (never include password_hash)
     res.json({
       token,
       user: { id: user.id, email: user.email },
@@ -483,10 +465,9 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// GET /auth/me - get current authenticated user (requires valid JWT)
+// GET /auth/me - get current authenticated user
 app.get('/auth/me', authenticateToken, async (req, res) => {
   try {
-    // req.user was set by the authenticateToken middleware
     const result = await pool.query(
       'SELECT id, email, created_at FROM users WHERE id = $1',
       [req.user.userId]
@@ -505,5 +486,5 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
 // Start server
 // ----------------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
