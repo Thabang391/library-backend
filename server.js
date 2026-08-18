@@ -10,6 +10,8 @@ const PORT = process.env.PORT || 3000;
 const pool = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+// ✅ Import email service
+const { sendWelcomeEmail, sendOverdueReminder } = require('./services/email');
 
 // Test database connection
 pool.query('SELECT NOW()', (err, res) => {
@@ -111,7 +113,6 @@ app.patch('/users/:id/role', authenticateToken, authorize('admin'), async (req, 
 // GET /admin/stats - admin dashboard analytics
 app.get('/admin/stats', authenticateToken, authorize('admin'), async (req, res) => {
   try {
-    // Parallel queries for performance
     const [
       totalBooksRes,
       totalAuthorsRes,
@@ -183,7 +184,6 @@ app.get('/admin/stats', authenticateToken, authorize('admin'), async (req, res) 
 // Book Routes
 // ----------------------------------------------------------------------
 
-// GET /books - list all books with advanced filtering, sorting, and pagination
 app.get('/books', async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
@@ -193,7 +193,6 @@ app.get('/books', async (req, res) => {
 
     const { title, author, genre, year, isbn } = req.query;
 
-    // Build dynamic WHERE clause
     const conditions = [];
     const params = [];
 
@@ -228,7 +227,6 @@ app.get('/books', async (req, res) => {
 
     let whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // ORDER BY clause (whitelisted)
     let orderByClause = `ORDER BY books.id ASC`;
     if (sortBy === 'title') {
       orderByClause = `ORDER BY books.title ${order}`;
@@ -240,7 +238,6 @@ app.get('/books', async (req, res) => {
       orderByClause = `ORDER BY avg_rating ${order} NULLS LAST`;
     }
 
-    // Count query
     const countQuery = `
       SELECT COUNT(*)::int AS total
       FROM books
@@ -250,7 +247,6 @@ app.get('/books', async (req, res) => {
     const countResult = await pool.query(countQuery, params);
     const total = countResult.rows[0].total;
 
-    // Data query with is_borrowed, avg_rating, review_count
     const offset = (page - 1) * limit;
     const dataQuery = `
       SELECT books.id, books.title, authors.name AS author, books.author_id, books.cover_image_url,
@@ -284,7 +280,6 @@ app.get('/books', async (req, res) => {
   }
 });
 
-// GET /books/:id - get one book by ID
 app.get('/books/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -318,7 +313,6 @@ app.get('/books/:id', async (req, res) => {
   }
 });
 
-// POST /books - requires 'admin' or 'librarian'
 app.post('/books', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const { title, authorId, coverImageUrl, genre, publicationYear, isbn } = req.body;
 
@@ -369,7 +363,6 @@ app.post('/books', authenticateToken, authorize('admin', 'librarian'), async (re
   }
 });
 
-// PATCH /books/:id - requires 'admin' or 'librarian'
 app.patch('/books/:id', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -447,7 +440,6 @@ app.patch('/books/:id', authenticateToken, authorize('admin', 'librarian'), asyn
   }
 });
 
-// DELETE /books/:id - requires 'admin' or 'librarian'
 app.delete('/books/:id', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -617,6 +609,10 @@ app.post('/auth/register', async (req, res) => {
       [email.trim().toLowerCase(), passwordHash, username.trim(), role]
     );
 
+    // ✅ Send welcome email (non-blocking)
+    sendWelcomeEmail(email.trim().toLowerCase(), username.trim())
+      .catch(err => console.error('Welcome email failed:', err));
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -652,6 +648,18 @@ app.post('/auth/login', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '24h' }
     );
+
+    // ✅ Check for overdue loans and send reminder (non-blocking)
+    const overdueQuery = await pool.query(
+      `SELECT b.title, l.due_date FROM loans l
+       JOIN books b ON l.book_id = b.id
+       WHERE l.user_id = $1 AND l.returned_at IS NULL AND l.due_date < NOW()`,
+      [user.id]
+    );
+    if (overdueQuery.rows.length > 0) {
+      sendOverdueReminder(email, user.username, overdueQuery.rows)
+        .catch(err => console.error('Overdue reminder failed:', err));
+    }
 
     res.json({
       token,
@@ -826,7 +834,6 @@ app.patch('/loans/:id/return', authenticateToken, async (req, res) => {
 // Reviews Routes
 // ----------------------------------------------------------------------
 
-// GET /books/:id/reviews - get all reviews for a book
 app.get('/books/:id/reviews', async (req, res) => {
   const bookId = Number(req.params.id);
   if (isNaN(bookId)) {
@@ -850,7 +857,6 @@ app.get('/books/:id/reviews', async (req, res) => {
   }
 });
 
-// POST /books/:id/reviews - create a review
 app.post('/books/:id/reviews', authenticateToken, async (req, res) => {
   const bookId = Number(req.params.id);
   if (isNaN(bookId)) {
@@ -867,13 +873,11 @@ app.post('/books/:id/reviews', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Check if book exists
     const bookCheck = await pool.query('SELECT id FROM books WHERE id = $1', [bookId]);
     if (bookCheck.rows.length === 0) {
       return res.status(404).json({ message: 'Book not found' });
     }
 
-    // Check if user already reviewed this book
     const existing = await pool.query(
       'SELECT id FROM reviews WHERE book_id = $1 AND user_id = $2',
       [bookId, userId]
@@ -896,7 +900,6 @@ app.post('/books/:id/reviews', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /reviews/:id - update a review (only own review)
 app.patch('/reviews/:id', authenticateToken, async (req, res) => {
   const reviewId = Number(req.params.id);
   if (isNaN(reviewId)) {
@@ -913,7 +916,6 @@ app.patch('/reviews/:id', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Check if review exists and belongs to user
     const reviewCheck = await pool.query(
       'SELECT id, user_id FROM reviews WHERE id = $1',
       [reviewId]
@@ -925,7 +927,6 @@ app.patch('/reviews/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'You can only edit your own reviews' });
     }
 
-    // Build dynamic update
     const fields = [];
     const values = [];
     let index = 1;
@@ -959,7 +960,6 @@ app.patch('/reviews/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /reviews/:id - delete a review (own review or admin)
 app.delete('/reviews/:id', authenticateToken, async (req, res) => {
   const reviewId = Number(req.params.id);
   if (isNaN(reviewId)) {
@@ -969,7 +969,6 @@ app.delete('/reviews/:id', authenticateToken, async (req, res) => {
   const userRole = req.user.role;
 
   try {
-    // Check if review exists
     const reviewCheck = await pool.query(
       'SELECT id, user_id FROM reviews WHERE id = $1',
       [reviewId]
@@ -979,7 +978,6 @@ app.delete('/reviews/:id', authenticateToken, async (req, res) => {
     }
     const review = reviewCheck.rows[0];
 
-    // Allow if user owns review or is admin
     if (review.user_id !== userId && userRole !== 'admin') {
       return res.status(403).json({ message: 'You can only delete your own reviews' });
     }
@@ -996,7 +994,6 @@ app.delete('/reviews/:id', authenticateToken, async (req, res) => {
 // Reading Lists Routes
 // ----------------------------------------------------------------------
 
-// GET /lists - get all lists for current user
 app.get('/lists', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1016,7 +1013,6 @@ app.get('/lists', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /lists - create a new list
 app.post('/lists', authenticateToken, async (req, res) => {
   const { name, description } = req.body;
   if (typeof name !== 'string' || name.trim() === '') {
@@ -1037,7 +1033,6 @@ app.post('/lists', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /lists/:id - update list
 app.patch('/lists/:id', authenticateToken, async (req, res) => {
   const listId = Number(req.params.id);
   if (isNaN(listId)) {
@@ -1046,7 +1041,6 @@ app.patch('/lists/:id', authenticateToken, async (req, res) => {
   const { name, description } = req.body;
 
   try {
-    // Verify ownership
     const ownerCheck = await pool.query(
       'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
       [listId, req.user.userId]
@@ -1087,7 +1081,6 @@ app.patch('/lists/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /lists/:id - delete a list
 app.delete('/lists/:id', authenticateToken, async (req, res) => {
   const listId = Number(req.params.id);
   if (isNaN(listId)) {
@@ -1109,7 +1102,6 @@ app.delete('/lists/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /lists/:id/books - get books in a list
 app.get('/lists/:id/books', authenticateToken, async (req, res) => {
   const listId = Number(req.params.id);
   if (isNaN(listId)) {
@@ -1117,7 +1109,6 @@ app.get('/lists/:id/books', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Verify ownership
     const ownerCheck = await pool.query(
       'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
       [listId, req.user.userId]
@@ -1143,7 +1134,6 @@ app.get('/lists/:id/books', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /lists/:id/books - add a book to a list
 app.post('/lists/:id/books', authenticateToken, async (req, res) => {
   const listId = Number(req.params.id);
   if (isNaN(listId)) {
@@ -1155,7 +1145,6 @@ app.post('/lists/:id/books', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Verify list ownership
     const listCheck = await pool.query(
       'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
       [listId, req.user.userId]
@@ -1164,13 +1153,11 @@ app.post('/lists/:id/books', authenticateToken, async (req, res) => {
       return res.status(404).json({ message: 'List not found' });
     }
 
-    // Check if book exists
     const bookCheck = await pool.query('SELECT id FROM books WHERE id = $1', [bookId]);
     if (bookCheck.rows.length === 0) {
       return res.status(404).json({ message: 'Book not found' });
     }
 
-    // Insert (ignore duplicate)
     await pool.query(
       `INSERT INTO list_books (list_id, book_id)
        VALUES ($1, $2)
@@ -1185,7 +1172,6 @@ app.post('/lists/:id/books', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /lists/:id/books/:bookId - remove a book from a list
 app.delete('/lists/:id/books/:bookId', authenticateToken, async (req, res) => {
   const listId = Number(req.params.id);
   const bookId = Number(req.params.bookId);
@@ -1194,7 +1180,6 @@ app.delete('/lists/:id/books/:bookId', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Verify list ownership
     const listCheck = await pool.query(
       'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
       [listId, req.user.userId]
@@ -1217,7 +1202,6 @@ app.delete('/lists/:id/books/:bookId', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /lists/check?bookId=... - get lists containing a book
 app.get('/lists/check', authenticateToken, async (req, res) => {
   const bookId = Number(req.query.bookId);
   if (isNaN(bookId) || bookId <= 0) {
