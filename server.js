@@ -22,8 +22,8 @@ pool.query('SELECT NOW()', (err, res) => {
 
 // Middleware to parse JSON request bodies
 const allowedOrigins = [
-  'http://localhost:5173',
-  'https://your-frontend.vercel.app', // replace with actual Vercel URL later
+  'https://library-backend-cm1v.onrender.com/',
+  'https://library-frontend-topaz.vercel.app/', // replace with actual Vercel URL later
 ];
 app.use(cors({
   origin: function (origin, callback) {
