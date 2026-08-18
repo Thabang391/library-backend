@@ -45,6 +45,21 @@ function authenticateToken(req, res, next) {
 }
 
 // ----------------------------------------------------------------------
+// Authorization Middleware for Roles
+// ----------------------------------------------------------------------
+function authorize(...roles) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ message: 'Forbidden: insufficient permissions' });
+    }
+    next();
+  };
+}
+
+// ----------------------------------------------------------------------
 // Root endpoint
 // ----------------------------------------------------------------------
 app.get('/', (req, res) => {
@@ -52,10 +67,52 @@ app.get('/', (req, res) => {
 });
 
 // ----------------------------------------------------------------------
+// User Routes (Admin only)
+// ----------------------------------------------------------------------
+app.get('/users', authenticateToken, authorize('admin'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, email, username, role, avatar_url, created_at FROM users ORDER BY id'
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PATCH /users/:id/role - Admin can change user roles
+app.patch('/users/:id/role', authenticateToken, authorize('admin'), async (req, res) => {
+  const userId = Number(req.params.id);
+  const { role } = req.body;
+
+  if (isNaN(userId)) {
+    return res.status(400).json({ message: 'Invalid user id' });
+  }
+  if (!role || !['admin', 'librarian', 'member'].includes(role)) {
+    return res.status(400).json({ message: 'Invalid role' });
+  }
+
+  try {
+    const result = await pool.query(
+      'UPDATE users SET role = $1 WHERE id = $2 RETURNING id, email, username, role',
+      [role, userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------------------------
 // Book Routes
 // ----------------------------------------------------------------------
 
-// GET /books - list all books with optional filtering, sorting, and pagination
+// GET /books - (unchanged)
 app.get('/books', async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
@@ -115,7 +172,7 @@ app.get('/books', async (req, res) => {
   }
 });
 
-// GET /books/:id - get one book by ID
+// GET /books/:id - (unchanged)
 app.get('/books/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
@@ -140,8 +197,8 @@ app.get('/books/:id', async (req, res) => {
   }
 });
 
-// POST /books - create a new book (requires authentication)
-app.post('/books', authenticateToken, async (req, res) => {
+// POST /books - requires 'admin' or 'librarian'
+app.post('/books', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const { title, authorId, coverImageUrl } = req.body;
 
   if (typeof title !== 'string' || title.trim() === '') {
@@ -179,8 +236,8 @@ app.post('/books', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /books/:id - update a book's title and/or author
-app.patch('/books/:id', authenticateToken, async (req, res) => {
+// PATCH /books/:id - requires 'admin' or 'librarian'
+app.patch('/books/:id', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
     return res.status(400).json({ message: 'Invalid id' });
@@ -235,8 +292,8 @@ app.patch('/books/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /books/:id - delete a book
-app.delete('/books/:id', authenticateToken, async (req, res) => {
+// DELETE /books/:id - requires 'admin' or 'librarian'
+app.delete('/books/:id', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
     return res.status(400).json({ message: 'Invalid id' });
@@ -255,7 +312,7 @@ app.delete('/books/:id', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------------------------
-// Author Routes (unchanged)
+// Author Routes
 // ----------------------------------------------------------------------
 
 app.get('/authors', async (req, res) => {
@@ -301,7 +358,8 @@ app.get('/authors/:id', async (req, res) => {
   }
 });
 
-app.post('/authors', authenticateToken, async (req, res) => {
+// POST /authors - requires 'admin' or 'librarian'
+app.post('/authors', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const { name } = req.body;
 
   if (typeof name !== 'string' || name.trim() === '') {
@@ -323,7 +381,8 @@ app.post('/authors', authenticateToken, async (req, res) => {
   }
 });
 
-app.patch('/authors/:id', authenticateToken, async (req, res) => {
+// PATCH /authors/:id - requires 'admin' or 'librarian'
+app.patch('/authors/:id', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
     return res.status(400).json({ message: 'Invalid id' });
@@ -351,7 +410,8 @@ app.patch('/authors/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/authors/:id', authenticateToken, async (req, res) => {
+// DELETE /authors/:id - requires 'admin' or 'librarian'
+app.delete('/authors/:id', authenticateToken, authorize('admin', 'librarian'), async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) {
     return res.status(400).json({ message: 'Invalid id' });
@@ -370,10 +430,10 @@ app.delete('/authors/:id', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------------------------
-// Authentication Routes
+// Authentication Routes (with role)
 // ----------------------------------------------------------------------
 
-// POST /auth/register - register a new user with username
+// POST /auth/register - (unchanged, default role = 'member')
 app.post('/auth/register', async (req, res) => {
   const { email, password, username } = req.body;
 
@@ -396,9 +456,10 @@ app.post('/auth/register', async (req, res) => {
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
+    // Default role: 'member'
     const result = await pool.query(
-      'INSERT INTO users (email, password_hash, username) VALUES ($1, $2, $3) RETURNING id, email, username, created_at',
-      [email.trim().toLowerCase(), passwordHash, username.trim()]
+      'INSERT INTO users (email, password_hash, username, role) VALUES ($1, $2, $3, $4) RETURNING id, email, username, role, created_at',
+      [email.trim().toLowerCase(), passwordHash, username.trim(), 'member']
     );
 
     res.status(201).json(result.rows[0]);
@@ -408,7 +469,7 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-// POST /auth/login - login and receive a JWT
+// POST /auth/login - include role in JWT
 app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -418,7 +479,7 @@ app.post('/auth/login', async (req, res) => {
 
   try {
     const result = await pool.query(
-      'SELECT id, email, username, avatar_url, password_hash FROM users WHERE email = $1',
+      'SELECT id, email, username, avatar_url, role, password_hash FROM users WHERE email = $1',
       [email.trim().toLowerCase()]
     );
     if (result.rows.length === 0) {
@@ -433,9 +494,9 @@ app.post('/auth/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, role: user.role },
       process.env.JWT_SECRET,
-      { expiresIn: '1h' }
+      { expiresIn: '24h' } // extended for convenience
     );
 
     res.json({
@@ -445,6 +506,7 @@ app.post('/auth/login', async (req, res) => {
         email: user.email,
         username: user.username,
         avatar_url: user.avatar_url,
+        role: user.role,
       },
     });
   } catch (err) {
@@ -453,11 +515,11 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// GET /auth/me - get current authenticated user
+// GET /auth/me - include role
 app.get('/auth/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, email, username, avatar_url, created_at FROM users WHERE id = $1',
+      'SELECT id, email, username, avatar_url, role, created_at FROM users WHERE id = $1',
       [req.user.userId]
     );
     if (result.rows.length === 0) {
@@ -470,7 +532,7 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /auth/me - update user profile (username, avatar_url)
+// PATCH /auth/me - (unchanged)
 app.patch('/auth/me', authenticateToken, async (req, res) => {
   const { username, avatarUrl } = req.body;
 
@@ -504,7 +566,7 @@ app.patch('/auth/me', authenticateToken, async (req, res) => {
     values.push(req.user.userId);
     const setClause = fields.join(', ');
     const result = await pool.query(
-      `UPDATE users SET ${setClause} WHERE id = $${index} RETURNING id, email, username, avatar_url, created_at`,
+      `UPDATE users SET ${setClause} WHERE id = $${index} RETURNING id, email, username, avatar_url, role, created_at`,
       values
     );
 
