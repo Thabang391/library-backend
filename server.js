@@ -108,6 +108,77 @@ app.patch('/users/:id/role', authenticateToken, authorize('admin'), async (req, 
   }
 });
 
+// GET /admin/stats - admin dashboard analytics
+app.get('/admin/stats', authenticateToken, authorize('admin'), async (req, res) => {
+  try {
+    // Parallel queries for performance
+    const [
+      totalBooksRes,
+      totalAuthorsRes,
+      totalUsersRes,
+      activeLoansRes,
+      overdueLoansRes,
+      mostBorrowedRes,
+      avgRatingByGenreRes,
+      recentActivityRes,
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*)::int AS count FROM books'),
+      pool.query('SELECT COUNT(*)::int AS count FROM authors'),
+      pool.query('SELECT COUNT(*)::int AS count FROM users'),
+      pool.query('SELECT COUNT(*)::int AS count FROM loans WHERE returned_at IS NULL'),
+      pool.query('SELECT COUNT(*)::int AS count FROM loans WHERE returned_at IS NULL AND due_date < NOW()'),
+      pool.query(`
+        SELECT b.id, b.title, a.name AS author, COUNT(l.id) AS loan_count
+        FROM books b
+        JOIN authors a ON b.author_id = a.id
+        JOIN loans l ON l.book_id = b.id
+        GROUP BY b.id, a.name
+        ORDER BY loan_count DESC
+        LIMIT 5
+      `),
+      pool.query(`
+        SELECT genre, ROUND(AVG(r.rating)::numeric, 2) AS avg_rating, COUNT(r.id) AS review_count
+        FROM books b
+        JOIN reviews r ON r.book_id = b.id
+        WHERE genre IS NOT NULL AND genre <> ''
+        GROUP BY genre
+        ORDER BY avg_rating DESC
+      `),
+      pool.query(`
+        (SELECT 'loan' AS type, l.id, l.borrowed_at AS created_at, u.username, b.title AS book_title
+         FROM loans l
+         JOIN users u ON l.user_id = u.id
+         JOIN books b ON l.book_id = b.id
+         ORDER BY l.borrowed_at DESC
+         LIMIT 5)
+        UNION ALL
+        (SELECT 'review' AS type, r.id, r.created_at, u.username, b.title AS book_title
+         FROM reviews r
+         JOIN users u ON r.user_id = u.id
+         JOIN books b ON r.book_id = b.id
+         ORDER BY r.created_at DESC
+         LIMIT 5)
+        ORDER BY created_at DESC
+        LIMIT 10
+      `),
+    ]);
+
+    res.json({
+      totalBooks: totalBooksRes.rows[0].count,
+      totalAuthors: totalAuthorsRes.rows[0].count,
+      totalUsers: totalUsersRes.rows[0].count,
+      activeLoans: activeLoansRes.rows[0].count,
+      overdueLoans: overdueLoansRes.rows[0].count,
+      mostBorrowed: mostBorrowedRes.rows,
+      avgRatingByGenre: avgRatingByGenreRes.rows,
+      recentActivity: recentActivityRes.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // ----------------------------------------------------------------------
 // Book Routes
 // ----------------------------------------------------------------------
