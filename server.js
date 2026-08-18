@@ -523,9 +523,15 @@ app.post('/auth/register', async (req, res) => {
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
+    // Check if email is in admin list (comma-separated in ADMIN_EMAILS env)
+    const adminEmails = process.env.ADMIN_EMAILS
+      ? process.env.ADMIN_EMAILS.split(',').map(e => e.trim().toLowerCase())
+      : [];
+    const role = adminEmails.includes(email.trim().toLowerCase()) ? 'admin' : 'member';
+
     const result = await pool.query(
       'INSERT INTO users (email, password_hash, username, role) VALUES ($1, $2, $3, $4) RETURNING id, email, username, role, created_at',
-      [email.trim().toLowerCase(), passwordHash, username.trim(), 'member']
+      [email.trim().toLowerCase(), passwordHash, username.trim(), role]
     );
 
     res.status(201).json(result.rows[0]);
