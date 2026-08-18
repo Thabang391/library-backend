@@ -922,6 +922,253 @@ app.delete('/reviews/:id', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------------------------
+// Reading Lists Routes
+// ----------------------------------------------------------------------
+
+// GET /lists - get all lists for current user
+app.get('/lists', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT l.id, l.name, l.description, l.created_at, l.updated_at,
+              COUNT(lb.id)::int AS book_count
+       FROM user_lists l
+       LEFT JOIN list_books lb ON lb.list_id = l.id
+       WHERE l.user_id = $1
+       GROUP BY l.id
+       ORDER BY l.created_at DESC`,
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /lists - create a new list
+app.post('/lists', authenticateToken, async (req, res) => {
+  const { name, description } = req.body;
+  if (typeof name !== 'string' || name.trim() === '') {
+    return res.status(400).json({ message: 'List name is required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO user_lists (user_id, name, description)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, description, created_at, updated_at`,
+      [req.user.userId, name.trim(), description || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PATCH /lists/:id - update list
+app.patch('/lists/:id', authenticateToken, async (req, res) => {
+  const listId = Number(req.params.id);
+  if (isNaN(listId)) {
+    return res.status(400).json({ message: 'Invalid list id' });
+  }
+  const { name, description } = req.body;
+
+  try {
+    // Verify ownership
+    const ownerCheck = await pool.query(
+      'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
+      [listId, req.user.userId]
+    );
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'List not found' });
+    }
+
+    const fields = [];
+    const values = [];
+    let index = 1;
+    if (name !== undefined) {
+      fields.push(`name = $${index}`);
+      values.push(name.trim());
+      index++;
+    }
+    if (description !== undefined) {
+      fields.push(`description = $${index}`);
+      values.push(description);
+      index++;
+    }
+    if (fields.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    fields.push(`updated_at = NOW()`);
+    values.push(listId);
+    const setClause = fields.join(', ');
+    const result = await pool.query(
+      `UPDATE user_lists SET ${setClause} WHERE id = $${index}
+       RETURNING id, name, description, created_at, updated_at`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// DELETE /lists/:id - delete a list
+app.delete('/lists/:id', authenticateToken, async (req, res) => {
+  const listId = Number(req.params.id);
+  if (isNaN(listId)) {
+    return res.status(400).json({ message: 'Invalid list id' });
+  }
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM user_lists WHERE id = $1 AND user_id = $2 RETURNING id',
+      [listId, req.user.userId]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'List not found' });
+    }
+    res.status(204).send();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /lists/:id/books - get books in a list
+app.get('/lists/:id/books', authenticateToken, async (req, res) => {
+  const listId = Number(req.params.id);
+  if (isNaN(listId)) {
+    return res.status(400).json({ message: 'Invalid list id' });
+  }
+
+  try {
+    // Verify ownership
+    const ownerCheck = await pool.query(
+      'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
+      [listId, req.user.userId]
+    );
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'List not found' });
+    }
+
+    const result = await pool.query(
+      `SELECT b.id, b.title, a.name AS author, b.cover_image_url, b.genre, b.publication_year,
+              lb.added_at
+       FROM list_books lb
+       JOIN books b ON lb.book_id = b.id
+       JOIN authors a ON b.author_id = a.id
+       WHERE lb.list_id = $1
+       ORDER BY lb.added_at DESC`,
+      [listId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /lists/:id/books - add a book to a list
+app.post('/lists/:id/books', authenticateToken, async (req, res) => {
+  const listId = Number(req.params.id);
+  if (isNaN(listId)) {
+    return res.status(400).json({ message: 'Invalid list id' });
+  }
+  const { bookId } = req.body;
+  if (!Number.isInteger(bookId) || bookId <= 0) {
+    return res.status(400).json({ message: 'Valid bookId required' });
+  }
+
+  try {
+    // Verify list ownership
+    const listCheck = await pool.query(
+      'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
+      [listId, req.user.userId]
+    );
+    if (listCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'List not found' });
+    }
+
+    // Check if book exists
+    const bookCheck = await pool.query('SELECT id FROM books WHERE id = $1', [bookId]);
+    if (bookCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Book not found' });
+    }
+
+    // Insert (ignore duplicate)
+    await pool.query(
+      `INSERT INTO list_books (list_id, book_id)
+       VALUES ($1, $2)
+       ON CONFLICT (list_id, book_id) DO NOTHING`,
+      [listId, bookId]
+    );
+
+    res.status(201).json({ message: 'Book added to list' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// DELETE /lists/:id/books/:bookId - remove a book from a list
+app.delete('/lists/:id/books/:bookId', authenticateToken, async (req, res) => {
+  const listId = Number(req.params.id);
+  const bookId = Number(req.params.bookId);
+  if (isNaN(listId) || isNaN(bookId)) {
+    return res.status(400).json({ message: 'Invalid id' });
+  }
+
+  try {
+    // Verify list ownership
+    const listCheck = await pool.query(
+      'SELECT id FROM user_lists WHERE id = $1 AND user_id = $2',
+      [listId, req.user.userId]
+    );
+    if (listCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'List not found' });
+    }
+
+    const result = await pool.query(
+      'DELETE FROM list_books WHERE list_id = $1 AND book_id = $2 RETURNING id',
+      [listId, bookId]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Book not in this list' });
+    }
+    res.status(204).send();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /lists/check?bookId=... - get lists containing a book
+app.get('/lists/check', authenticateToken, async (req, res) => {
+  const bookId = Number(req.query.bookId);
+  if (isNaN(bookId) || bookId <= 0) {
+    return res.status(400).json({ message: 'Valid bookId required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT l.id, l.name
+       FROM user_lists l
+       JOIN list_books lb ON lb.list_id = l.id
+       WHERE l.user_id = $1 AND lb.book_id = $2`,
+      [req.user.userId, bookId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------------------------
 // Start server
 // ----------------------------------------------------------------------
 app.listen(PORT, () => {
